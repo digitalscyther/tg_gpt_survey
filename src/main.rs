@@ -1,8 +1,9 @@
 // $env:RUST_LOG="debug"; $env:TELOXIDE_TOKEN=""; cargo run
+use dotenv::dotenv;
+use env_logger;
 use log::*;
 use rusqlite::{params, Connection, Result};
 use serde_json::{json, Value};
-use env_logger;
 use teloxide::prelude::*;
 
 const DEFAULT_PARAMS: [&str; 2] = ["Name", "Phone"];
@@ -128,9 +129,22 @@ async fn prepare_db(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+async fn run_bot(_conn: &Connection) -> Result<()> {
+    let bot = Bot::from_env();
+
+    teloxide::repl(bot, |bot: Bot, msg: Message| async move {
+        bot.send_dice(msg.chat.id).await?;
+        Ok(())
+    })
+    .await;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
+    dotenv().ok();
 
     // Attempt to open the database connection
     let conn = match Connection::open("db.sqlite") {
@@ -146,13 +160,10 @@ async fn main() -> Result<()> {
         return Err(err);
     }
 
-    let bot = Bot::from_env();
-
-    teloxide::repl(bot, |bot: Bot, msg: Message| async move {
-        bot.send_dice(msg.chat.id).await?;
-        Ok(())
-    })
-    .await;
+    if let Err(err) = run_bot(&conn).await {
+        eprintln!("Failed bot running: {}", err);
+        return Err(err);
+    }
 
     Ok(())
 }

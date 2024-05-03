@@ -1,3 +1,6 @@
+.env
 db.sqlite
+
+.idea/
 
 /target
