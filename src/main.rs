@@ -8,6 +8,7 @@ use teloxide::dispatching::dialogue::InMemStorage;
 use teloxide::prelude::*;
 
 
+const DB_NAME: &str = "db.sqlite";
 const USER_TABLE_NAME: &str = "user";
 const DEFAULT_PARAMS: [&str; 2] = ["Name", "Phone"];
 const DEFAULT_PROMPT: &str = "hello";
@@ -264,7 +265,6 @@ impl UserSurvey {
 
         match get_user_data(self.chat_id, &self.survey_config.params, &conn, false) {
             (None, _) => {
-                info!("1");
                 conn.execute(
                     &format!(
                         "INSERT INTO {} (chat_id, data) VALUES (?, ?)",
@@ -274,7 +274,6 @@ impl UserSurvey {
                 )?;
             }
             (Some(_), _) => {
-                info!("2");
                 conn.execute(
                     &format!(
                         "UPDATE {} SET data = ? WHERE chat_id = ?",
@@ -284,8 +283,6 @@ impl UserSurvey {
                 )?;
             }
         }
-
-        info!("3");
 
         Ok(())
     }
@@ -297,7 +294,7 @@ type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 #[derive(Clone, Default)]
 pub enum State {
     #[default]
-    Start,
+    // Start,
     Answer,
 }
 
@@ -309,7 +306,7 @@ async fn run_bot() -> Result<()> {
         bot,
         Update::filter_message()
             .enter_dialogue::<Message, InMemStorage<State>, State>()
-            .branch(dptree::case![State::Start].endpoint(start))
+            // .branch(dptree::case![State::Start].endpoint(start))
             .branch(dptree::case![State::Answer].endpoint(answer)),
     )
         .dependencies(dptree::deps![InMemStorage::<State>::new()])
@@ -321,12 +318,11 @@ async fn run_bot() -> Result<()> {
     Ok(())
 }
 
-
-async fn start(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
-    bot.send_message(msg.chat.id, "Let's start! What's your name?").await?;
-    dialogue.update(State::Answer).await?;
-    Ok(())
-}
+// async fn start(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
+//     bot.send_message(msg.chat.id, "Let's start! What's your name?").await?;
+//     dialogue.update(State::Answer).await?;
+//     Ok(())
+// }
 
 async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult {
     let text = match msg.text() {
@@ -347,9 +343,27 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
         return Ok(());
     }
 
-    if text == "/clear_user_table" {
-        clear_user_table(&conn).unwrap();
-        bot.send_message(msg.chat.id, "User table cleared").await?;
+    if text == "/export_csv" {
+        // TODO
+        bot.send_message(msg.chat.id, "TODO 1").await?;
+        return Ok(());
+    }
+
+    if text == "/start" || text == "/help" {
+        // TODO
+        bot.send_message(msg.chat.id, "TODO 2").await?;
+        return Ok(());
+    }
+
+    if text.starts_with("/prompt") {
+        // TODO
+        bot.send_message(msg.chat.id, "TODO 3").await?;
+        return Ok(());
+    }
+
+    if text.starts_with("/params") {
+        // TODO
+        bot.send_message(msg.chat.id, "TODO 4").await?;
         return Ok(());
     }
 
@@ -372,7 +386,7 @@ async fn get_question(user_survey: &UserSurvey) -> Result<String> {
 }
 
 fn establish_connection() -> Result<Connection, rusqlite::Error> {
-    let conn = Connection::open("db.sqlite")?;
+    let conn = Connection::open(DB_NAME)?;
     Ok(conn)
 }
 
