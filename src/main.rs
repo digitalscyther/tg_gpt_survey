@@ -369,11 +369,12 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
 
     user_survey.add_user_answer(text);
     let question = get_question(&user_survey).await.expect("foo");
+
+    bot.send_message(msg.chat.id, &question).await?;
+
     user_survey.add_assistant_question(question.as_str());
     user_survey.sync_data(&conn).ok();
     info!("{:?}", user_survey);
-
-    bot.send_message(msg.chat.id, format!("Your text: {text}")).await?;
 
     Ok(())
 }
