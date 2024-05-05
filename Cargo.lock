@@ -1410,6 +1410,7 @@ dependencies = [
  "env_logger",
  "log",
  "rusqlite",
+ "serde",
  "serde_json",
  "teloxide",
  "tokio",
