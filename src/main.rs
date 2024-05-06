@@ -1,4 +1,5 @@
 // $env:RUST_LOG="debug"; $env:TELOXIDE_TOKEN=""; cargo run
+use std::collections::HashMap;
 use std::env;
 use dotenv::dotenv;
 use env_logger;
@@ -15,7 +16,7 @@ use teloxide::types::ChatAction;
 const DB_NAME: &str = "db.sqlite";
 const USER_TABLE_NAME: &str = "user";
 const DEFAULT_PARAMS: [&str; 2] = ["Name", "Phone"];
-const DEFAULT_PROMPT: &str = "# Character\nYou are an HR specialist at [Company Name]. Your task is to interview candidates for the position of Marketing Manager.\n\n## Skills\n\n### Skill 1: Gathering Candidate Information\n- Inquire about the following:\n{}\n- Already acquired information:\n{}\\n\n## Constraints:\n- Ensure the conversation continues until all information is gathered. Once complete, bid farewell and inform the candidate that they will receive a response regarding their candidacy via the provided email address or phone number. Provide these contact details in your closing statement. No need to ask more if there is nothing in \"Inquire about the following\". If person ask to change data, do it.";
+const DEFAULT_PROMPT: &str = "# Character\nYou are an HR specialist at [Company Name]. Your task is to interview candidates for the position of Marketing Manager.\n\n## Skills\n\n### Skill 1: Gathering Candidate Information\n- Inquire about the following:\n{}\n\n## Constraints:\n- Ensure the conversation continues until all information is gathered. Once complete, bid farewell and inform the candidate that they will receive a response regarding their candidacy via the provided email address or phone number. Provide these contact details in your closing statement. No need to ask more if there is nothing in \"Inquire about the following\". If person ask to change data, do it.";
 
 const HISTORY_LIMIT: usize = 5000;
 
@@ -119,13 +120,10 @@ impl SurveyConfig {
         Self { params, prompt }
     }
 
-    fn format_prompt(&self, unknown_str: &str, known_str: &str) -> String {
+    fn format_prompt(&self, unknown_str: &str) -> String {
         let mut prompt = self.prompt.clone();
         if let Some(index) = prompt.find("{}") {
             prompt.replace_range(index..(index + 2), unknown_str);
-        }
-        if let Some(index) = prompt.find("{}") {
-            prompt.replace_range(index..(index + 2), known_str);
         }
         prompt
     }
@@ -262,7 +260,7 @@ impl UserSurvey {
         Self { chat_id, survey_config, _data }
     }
 
-    fn set_param(&mut self, arg: &FunctionArg) -> Result<()> {
+    fn set_param(&mut self, arg: &FunctionArg) -> Result<String> {
         if arg.index < 0 || arg.index as usize >= self._data.params.len() {
             panic!("foo")
         }
@@ -270,45 +268,33 @@ impl UserSurvey {
         let param = &mut self._data.params[arg.index as usize];
         param.value = Some(arg.value.clone());
 
-        Ok(())
+        // TODO not changing?
+
+        Ok(param.name.to_string())
     }
 
     fn get_gpt_messages(&mut self) -> Vec<GptMessage> {
-        let known: Vec<Param> = self._data.params
-            .iter()
-            .filter_map(|param| {
-                param.value.clone().map(|value| Param {
-                    index: param.index,
-                    name: param.name.clone(),
-                    value: Some(value),
-                })
-            })
-            .collect();
-
-        // 2. Generate unknown_str
-        let mut unknown_str = self.survey_config.params
-            .iter()
-            .enumerate()
-            .filter(|(_, survey_param_name)| !known.iter().any(|known_param| known_param.name == **survey_param_name))
-            .map(|(index, name)| format!("[{}] {}", index, name))
-            .collect::<Vec<String>>()
-            .join("\n");
-
-        if unknown_str.is_empty() {
-            unknown_str = String::from("All params collected. Finish the interview.")
+        let mut known: HashMap<usize, String> = HashMap::new();
+        for param in &self._data.params {
+            if let Some(value) = &param.value {
+                known.insert(param.index as usize, value.clone());
+            }
         }
 
-        // 3. Generate known_str
-        let known_str = known
-            .iter()
-            .map(|param| format!("[{}] {} - {}", param.index, param.name, param.value.as_ref().unwrap()))
-            .collect::<Vec<String>>()
-            .join("\n");
+        // Generate the result string
+        let mut know_unknown = String::new();
+        for (index, name) in self.survey_config.params.iter().enumerate() {
+            if let Some(value) = known.get(&index) {
+                know_unknown.push_str(&format!("[{}] - {} - {} (already set)\n", index, name, value));
+            } else {
+                know_unknown.push_str(&format!("[{}] - {} - ? (need to ask)\n", index, name));
+            }
+        }
 
         let mut result = vec![
             GptMessage {
                 role: "system".to_string(),
-                content: self.survey_config.format_prompt(&unknown_str, &known_str),
+                content: self.survey_config.format_prompt(&know_unknown),
             }
         ];
         let mut chars_count = result[0].content.len();
@@ -326,6 +312,10 @@ impl UserSurvey {
 
     fn add_user_answer(&mut self, text: &str) {
         self.add_message("user", text);
+    }
+
+    fn add_system_text(&mut self, text: &str) {
+        self.add_message("system", text);
     }
 
     fn add_assistant_question(&mut self, text: &str) {
@@ -466,9 +456,8 @@ async fn get_question(user_survey: &mut UserSurvey, counter: u8) -> Result<Optio
         GptAnswer::Question(question) => Ok(Some(question)),
         GptAnswer::FunctionCallArgs(call_args) => {
             for arg in &call_args {
-                user_survey.set_param(&arg)?;
-                user_survey.add_assistant_question(&format!("Param {} saved!", arg.index));
-                user_survey.add_user_answer("What now?");
+                let param_name = user_survey.set_param(&arg)?;
+                user_survey.add_system_text(&format!("Param [{}] {} set to {}!", arg.index, param_name, arg.value));
             }
 
             Box::pin(get_question(user_survey, counter + 1)).await
@@ -506,13 +495,13 @@ async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -
             "function": {
                 "name": "set_params",
                 // "description": format!("Set or update parameter by index for:\n{}", params_description),
-                "description": "Set or update parameter by index",
+                "description": "Set parameter by index",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "to_set": {
                             "type": "array",
-                            "description": "params to set or update",
+                            "description": "params to set",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -522,7 +511,7 @@ async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -
                                     },
                                     "value": {
                                         "type": "string",
-                                        "description": "Value to set or update at the index"
+                                        "description": "Value to set at the index"
                                     }
                                 }
                             }
