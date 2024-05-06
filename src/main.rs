@@ -16,9 +16,10 @@ use teloxide::types::ChatAction;
 const DB_NAME: &str = "db.sqlite";
 const USER_TABLE_NAME: &str = "user";
 const DEFAULT_PARAMS: [&str; 2] = ["Name", "Phone"];
-const DEFAULT_PROMPT: &str = "# Character\nYou are an HR specialist at [Company Name]. Your task is to interview candidates for the position of Marketing Manager.\n\n## Skills\n\n### Skill 1: Gathering Candidate Information\n- Inquire about the following:\n{}\n\n## Constraints:\n- Ensure the conversation continues until all information is gathered. Once complete, bid farewell and inform the candidate that they will receive a response regarding their candidacy via the provided email address or phone number. Provide these contact details in your closing statement. No need to ask more if there is nothing in \"Inquire about the following\". If person ask to change data, do it.";
+const DEFAULT_PROMPT: &str = "# Character\nYou are an HR specialist at Google Meta. Your task is to interview candidates for the position of Marketing Manager.\n\n## Skills\n\n### Skill 1: Gathering Candidate Information\n- Inquire about the following:\n{}\n\n## Constraints:\n- Ensure the conversation continues until all information is gathered. Once complete, bid farewell and inform the candidate that they will receive a response regarding their candidacy via the provided email address or phone number. Provide these contact details in your closing statement. No need to ask more if there is nothing in \"Inquire about the following\". If person ask to change data, do it.";
 
-const HISTORY_LIMIT: usize = 5000;
+const HISTORY_LIMIT: usize = 10000;
+const MAX_USER_TOKENS: i64 = 5000;
 
 async fn create_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(
@@ -30,11 +31,12 @@ async fn create_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
     )?;
 
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS user (
+        &format!("CREATE TABLE IF NOT EXISTS {} (
             id INTEGER PRIMARY KEY,
             chat_id INTEGER NOT NULL,
+            tokens INTEGER NOT NUll,
             data TEXT NOT NULL
-        )",
+        )", USER_TABLE_NAME),
         [],
     )?;
 
@@ -80,13 +82,13 @@ fn get_survey_data(conn: &Connection) -> Result<String, rusqlite::Error> {
     Ok(data)
 }
 
-fn get_user_data_json(chat_id: i64, conn: &Connection) -> Result<String, rusqlite::Error> {
-    let data: String = conn.query_row(
-        "SELECT data FROM user WHERE chat_id = ? ORDER BY id LIMIT 1",
+fn get_user_data_json(chat_id: i64, conn: &Connection) -> Result<(i64, String), rusqlite::Error> {
+    let row = conn.query_row(
+        &format!("SELECT tokens, data FROM {} WHERE chat_id = ? ORDER BY id LIMIT 1", USER_TABLE_NAME),
         params![chat_id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    Ok(data)
+    Ok(row)
 }
 
 fn clear_user_table(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -144,18 +146,18 @@ fn get_user_data(
     params: &Vec<String>,
     conn: &Connection,
     or_default: bool,
-) -> (Option<UserData>, bool) {
+) -> (Option<(i64, UserData)>, bool) {
     match get_user_data_json(chat_id, conn) {
-        Ok(json_string) => {
+        Ok((tokens, json_string)) => {
             if let Some(user_data) = extract_user_data(&json_string) {
-                (Some(user_data), false)
+                (Some((tokens, user_data)), false)
             } else if or_default {
-                (Some(UserData::default(params)), true)
+                (Some((MAX_USER_TOKENS, UserData::default(params))), true)
             } else {
                 (None, false)
             }
         }
-        Err(_) if or_default => (Some(UserData::default(params)), true),
+        Err(_) if or_default => (Some((MAX_USER_TOKENS, UserData::default(params))), true),
         _ => (None, false),
     }
 }
@@ -250,14 +252,15 @@ impl UserData {
 #[derive(Debug)]
 struct UserSurvey {
     chat_id: i64,
+    tokens: i64,
     survey_config: SurveyConfig,
     _data: UserData,
 }
 
 impl UserSurvey {
     fn new(chat_id: i64, survey_config: SurveyConfig, conn: &Connection) -> Self {
-        let _data = get_user_data(chat_id, &survey_config.params, conn, true).0.expect("foo");
-        Self { chat_id, survey_config, _data }
+        let (tokens, _data) = get_user_data(chat_id, &survey_config.params, conn, true).0.expect("foo");
+        Self { chat_id, tokens, survey_config, _data }
     }
 
     fn set_param(&mut self, arg: &FunctionArg) -> Result<String> {
@@ -332,24 +335,33 @@ impl UserSurvey {
     fn sync_data(&mut self, conn: &Connection) -> Result<()> {
         let data_str = serde_json::to_string(&self._data).expect("Serialization failed");
 
-        match get_user_data(self.chat_id, &self.survey_config.params, &conn, false) {
-            (None, _) => {
+        let existing_data: Option<i32> = match conn.query_row(
+            &format!("SELECT id FROM {} WHERE chat_id = ?", USER_TABLE_NAME),
+            params![self.chat_id],
+            |row| row.get(0),
+        ) {
+            Ok(id) => Some(id),
+            Err(_) => None,
+        };
+
+        match existing_data {
+            Some(_) => {
                 conn.execute(
                     &format!(
-                        "INSERT INTO {} (chat_id, data) VALUES (?, ?)",
+                        "UPDATE {} SET data = ?, tokens = ? WHERE chat_id = ?",
                         USER_TABLE_NAME
                     ),
-                    params![self.chat_id, data_str],
+                    params![data_str, self.tokens, self.chat_id],
                 )?;
             }
-            (Some(_), _) => {
+            None => {
                 conn.execute(
                     &format!(
-                        "UPDATE {} SET data = ? WHERE chat_id = ?",
+                        "INSERT INTO {} (chat_id, tokens, data) VALUES (?, ?, ?)",
                         USER_TABLE_NAME
                     ),
-                    params![data_str, self.chat_id],
-                )?;
+                    params![self.chat_id, self.tokens, data_str],
+                ).expect("Insertion failed");
             }
         }
 
@@ -431,10 +443,11 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
     }
 
     user_survey.add_user_answer(text);
-    let question = get_question(&mut user_survey, 1).await.expect("foo").unwrap();
+    let (spent_tokens, question) = get_question(&mut user_survey, 1, 0).await.expect("foo").unwrap();
 
     bot.send_message(msg.chat.id, &question).await?;
 
+    user_survey.tokens -= spent_tokens;
     user_survey.add_assistant_question(question.as_str());
     user_survey.sync_data(&conn).ok();
     info!("{:?}", user_survey);
@@ -442,25 +455,28 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
     Ok(())
 }
 
-async fn get_question(user_survey: &mut UserSurvey, counter: u8) -> Result<Option<String>, Box<dyn std::error::Error>> {
+async fn get_question(user_survey: &mut UserSurvey, counter: u8, tokens: i64) -> Result<Option<(i64, String)>, Box<dyn std::error::Error>> {
     if counter > 3 {
-        return Ok(Some("Error get question".to_string()));    // TODO
+        return Ok(Some((tokens, "Error get question".to_string())));
+    }
+    if user_survey.tokens < 0 {
+        return Ok(Some((tokens, "Have a great day!".to_string())));
     }
 
     let messages = &user_survey.get_gpt_messages();
     let params = &user_survey.survey_config.params;
 
-    let gpt_answer = get_openai_question(messages, params).await?;
+    let (gpt_answer, spent_tokens) = get_openai_question(messages, params).await?;
 
     match gpt_answer {
-        GptAnswer::Question(question) => Ok(Some(question)),
+        GptAnswer::Question(question) => Ok(Some((spent_tokens + tokens, question))),
         GptAnswer::FunctionCallArgs(call_args) => {
             for arg in &call_args {
                 let param_name = user_survey.set_param(&arg)?;
                 user_survey.add_system_text(&format!("Param [{}] {} set to {}!", arg.index, param_name, arg.value));
             }
 
-            Box::pin(get_question(user_survey, counter + 1)).await
+            Box::pin(get_question(user_survey, counter + 1, spent_tokens + tokens)).await
         }
     }
 }
@@ -478,7 +494,7 @@ struct FunctionArg {
     value: String,
 }
 
-async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -> Result<GptAnswer> {
+async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -> Result<(GptAnswer, i64)> {
     let openai_api_key = &env::var("OPENAI_API_KEY").expect("foo");
 
     let client = reqwest::Client::builder()
@@ -494,14 +510,13 @@ async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -
             "type": "function",
             "function": {
                 "name": "set_params",
-                // "description": format!("Set or update parameter by index for:\n{}", params_description),
-                "description": "Set parameter by index",
+                "description": "Set parameter values by index",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "to_set": {
                             "type": "array",
-                            "description": "params to set",
+                            "description": "Array of parameters to set",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -510,10 +525,10 @@ async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -
                                         "description": "Index of the parameter"
                                     },
                                     "value": {
-                                        "type": "string",
                                         "description": "Value to set at the index"
                                     }
-                                }
+                                },
+                                "required": ["index", "value"]
                             }
                         }
                     },
@@ -542,10 +557,11 @@ async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -
     Ok(gpt_answer)
 }
 
-fn json_to_gpt_answer(json_str: &String) -> GptAnswer {
+fn json_to_gpt_answer(json_str: &String) -> (GptAnswer, i64) {
     let v: Value = serde_json::from_str(json_str).unwrap();
 
     let finish_reason = v["choices"][0]["finish_reason"].as_str().unwrap_or("");
+    let spent_tokens = v["usage"]["total_tokens"].as_i64().unwrap_or(0);
 
     match finish_reason {
         "tool_calls" => {
@@ -562,14 +578,14 @@ fn json_to_gpt_answer(json_str: &String) -> GptAnswer {
                 let value = arg["value"].as_str().unwrap().to_string();
                 function_args.push(FunctionArg { index, value });
             }
-            GptAnswer::FunctionCallArgs(function_args)
+            (GptAnswer::FunctionCallArgs(function_args), spent_tokens)
         }
         "stop" => {
             let content = v["choices"][0]["message"]["content"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            GptAnswer::Question(content)
+            (GptAnswer::Question(content), spent_tokens)
         }
         _ => panic!("Unknown finish_reason"),
     }
