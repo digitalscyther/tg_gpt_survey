@@ -1,9 +1,12 @@
 // $env:RUST_LOG="debug"; $env:TELOXIDE_TOKEN=""; cargo run
+use std::env;
 use dotenv::dotenv;
 use env_logger;
 use log::*;
+use reqwest::header::HeaderMap;
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use teloxide::dispatching::dialogue::InMemStorage;
 use teloxide::prelude::*;
 
@@ -292,9 +295,8 @@ type MyDialogue = Dialogue<State, InMemStorage<State>>;
 type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Clone, Default)]
-pub enum State {
+enum State {
     #[default]
-    // Start,
     Answer,
 }
 
@@ -306,7 +308,6 @@ async fn run_bot() -> Result<()> {
         bot,
         Update::filter_message()
             .enter_dialogue::<Message, InMemStorage<State>, State>()
-            // .branch(dptree::case![State::Start].endpoint(start))
             .branch(dptree::case![State::Answer].endpoint(answer)),
     )
         .dependencies(dptree::deps![InMemStorage::<State>::new()])
@@ -317,12 +318,6 @@ async fn run_bot() -> Result<()> {
 
     Ok(())
 }
-
-// async fn start(bot: Bot, dialogue: MyDialogue, msg: Message) -> HandlerResult {
-//     bot.send_message(msg.chat.id, "Let's start! What's your name?").await?;
-//     dialogue.update(State::Answer).await?;
-//     Ok(())
-// }
 
 async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult {
     let text = match msg.text() {
@@ -380,10 +375,128 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
 }
 
 async fn get_question(user_survey: &UserSurvey) -> Result<String> {
+    let openai_resp = get_openai_question(&user_survey._data.messages, &user_survey.survey_config.params).await.expect("foo");
+    info!("{:?}", openai_resp);
+
     Ok(format!(
         "What's your {}?",
         user_survey._data.params.first().map(|f| &f.name).unwrap_or(&"parameter".to_string())
     ))
+}
+
+
+#[derive(Debug)]
+enum GptAnswer {
+    Question(String),
+    FunctionCallArgs(Vec<FunctionArg>),
+}
+
+#[derive(Debug)]
+struct FunctionArg {
+    index: i32,
+    value: String,
+}
+
+async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -> Result<GptAnswer> {
+    let openai_api_key = &env::var("OPENAI_API_KEY").expect("foo");
+
+    let client = reqwest::Client::builder()
+        .build().expect("foo");
+
+    let mut headers = HeaderMap::new();
+    headers.insert("Content-Type", "application/json".parse().expect("foo"));
+    headers.insert("Authorization", format!("Bearer {}", openai_api_key).parse().expect("foo"));
+
+    let mut tools = Vec::new();
+    if !params.is_empty() {
+        let params_description = params.iter().enumerate()
+            .map(|(index, param)| format!("[{}] {}", index, param))
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "set_params",
+                "description": format!("Set or update parameter by index for:\n{}", params_description),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "to_set": {
+                            "type": "array",
+                            "description": "params to set or update",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "index": {
+                                        "type": "integer",
+                                        "description": "Index of the parameter"
+                                    },
+                                    "value": {
+                                        "type": "string",
+                                        "description": "Value to set or update at the index"
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "required": ["to_set"]
+                }
+            }
+        }));
+    }
+
+    let data = json!({
+        "model": "gpt-4",
+        "messages": messages,
+        "temperature": 0.7,
+        "tools": tools
+    });
+
+    let response = client.post("https://api.openai.com/v1/chat/completions")
+        .headers(headers)
+        .json(&data)
+        .send()
+        .await.expect("foo");
+
+    let body = response.text().await.expect("foo");
+
+    let gpt_answer = json_to_gpt_answer(&body);
+
+    Ok(gpt_answer)
+}
+
+fn json_to_gpt_answer(json_str: &String) -> GptAnswer {
+    let v: Value = serde_json::from_str(json_str).unwrap();
+
+    let finish_reason = v["choices"][0]["finish_reason"].as_str().unwrap_or("");
+
+    match finish_reason {
+        "tool_calls" => {
+            let args = v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap_or("");
+            let args = args.replace("\\", "");
+            let args = args.trim_matches('"');
+
+            let mut function_args = Vec::new();
+            let args_json: Value = serde_json::from_str(args).unwrap();
+            for arg in args_json["to_set"].as_array().unwrap() {
+                let index = arg["index"].as_i64().unwrap() as i32;
+                let value = arg["value"].as_str().unwrap().to_string();
+                function_args.push(FunctionArg { index, value });
+            }
+            GptAnswer::FunctionCallArgs(function_args)
+        }
+        "stop" => {
+            let content = v["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            GptAnswer::Question(content)
+        }
+        _ => panic!("Unknown finish_reason"),
+    }
 }
 
 fn establish_connection() -> Result<Connection, rusqlite::Error> {
