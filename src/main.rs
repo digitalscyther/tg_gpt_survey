@@ -9,12 +9,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use teloxide::dispatching::dialogue::InMemStorage;
 use teloxide::prelude::*;
+use teloxide::types::ChatAction;
 
 
 const DB_NAME: &str = "db.sqlite";
 const USER_TABLE_NAME: &str = "user";
 const DEFAULT_PARAMS: [&str; 2] = ["Name", "Phone"];
-const DEFAULT_PROMPT: &str = "hello";
+const DEFAULT_PROMPT: &str = "# Character\nYou are an HR specialist at [Company Name]. Your task is to interview candidates for the position of Marketing Manager.\n\n## Skills\n\n### Skill 1: Gathering Candidate Information\n- Inquire about the following:\n{}\n- Already acquired information:\n{}\\n\n## Constraints:\n- Ensure the conversation continues until all information is gathered. Once complete, bid farewell and inform the candidate that they will receive a response regarding their candidacy via the provided email address or phone number. Provide these contact details in your closing statement. No need to ask more if there is nothing in \"Inquire about the following\". If person ask to change data, do it.";
+
+const HISTORY_LIMIT: usize = 5000;
 
 async fn create_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(
@@ -115,6 +118,17 @@ impl SurveyConfig {
     fn new(params: Vec<String>, prompt: String) -> Self {
         Self { params, prompt }
     }
+
+    fn format_prompt(&self, unknown_str: &str, known_str: &str) -> String {
+        let mut prompt = self.prompt.clone();
+        if let Some(index) = prompt.find("{}") {
+            prompt.replace_range(index..(index + 2), unknown_str);
+        }
+        if let Some(index) = prompt.find("{}") {
+            prompt.replace_range(index..(index + 2), known_str);
+        }
+        prompt
+    }
 }
 
 fn get_survey_config(conn: &Connection) -> Option<SurveyConfig> {
@@ -203,7 +217,7 @@ struct Param {
 }
 
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct GptMessage {
     role: String,
     content: String,
@@ -246,6 +260,68 @@ impl UserSurvey {
     fn new(chat_id: i64, survey_config: SurveyConfig, conn: &Connection) -> Self {
         let _data = get_user_data(chat_id, &survey_config.params, conn, true).0.expect("foo");
         Self { chat_id, survey_config, _data }
+    }
+
+    fn set_param(&mut self, arg: &FunctionArg) -> Result<()> {
+        if arg.index < 0 || arg.index as usize >= self._data.params.len() {
+            panic!("foo")
+        }
+
+        let param = &mut self._data.params[arg.index as usize];
+        param.value = Some(arg.value.clone());
+
+        Ok(())
+    }
+
+    fn get_gpt_messages(&mut self) -> Vec<GptMessage> {
+        let known: Vec<Param> = self._data.params
+            .iter()
+            .filter_map(|param| {
+                param.value.clone().map(|value| Param {
+                    index: param.index,
+                    name: param.name.clone(),
+                    value: Some(value),
+                })
+            })
+            .collect();
+
+        // 2. Generate unknown_str
+        let mut unknown_str = self.survey_config.params
+            .iter()
+            .enumerate()
+            .filter(|(_, survey_param_name)| !known.iter().any(|known_param| known_param.name == **survey_param_name))
+            .map(|(index, name)| format!("[{}] {}", index, name))
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        if unknown_str.is_empty() {
+            unknown_str = String::from("All params collected. Finish the interview.")
+        }
+
+        // 3. Generate known_str
+        let known_str = known
+            .iter()
+            .map(|param| format!("[{}] {} - {}", param.index, param.name, param.value.as_ref().unwrap()))
+            .collect::<Vec<String>>()
+            .join("\n");
+
+        let mut result = vec![
+            GptMessage {
+                role: "system".to_string(),
+                content: self.survey_config.format_prompt(&unknown_str, &known_str),
+            }
+        ];
+        let mut chars_count = result[0].content.len();
+
+        for msg in self._data.messages.iter().rev() {
+            chars_count += msg.content.len();
+            if chars_count > HISTORY_LIMIT {
+                break;
+            }
+            result.insert(1, msg.clone());
+        }
+
+        result
     }
 
     fn add_user_answer(&mut self, text: &str) {
@@ -320,6 +396,8 @@ async fn run_bot() -> Result<()> {
 }
 
 async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult {
+    bot.send_chat_action(msg.chat.id, ChatAction::Typing).await?;
+
     let text = match msg.text() {
         Some(text) => text,
         _ => {
@@ -363,7 +441,7 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
     }
 
     user_survey.add_user_answer(text);
-    let question = get_question(&user_survey).await.expect("foo");
+    let question = get_question(&mut user_survey, 1).await.expect("foo").unwrap();
 
     bot.send_message(msg.chat.id, &question).await?;
 
@@ -374,14 +452,28 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
     Ok(())
 }
 
-async fn get_question(user_survey: &UserSurvey) -> Result<String> {
-    let openai_resp = get_openai_question(&user_survey._data.messages, &user_survey.survey_config.params).await.expect("foo");
-    info!("{:?}", openai_resp);
+async fn get_question(user_survey: &mut UserSurvey, counter: u8) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if counter > 3 {
+        return Ok(Some("Error get question".to_string()));    // TODO
+    }
 
-    Ok(format!(
-        "What's your {}?",
-        user_survey._data.params.first().map(|f| &f.name).unwrap_or(&"parameter".to_string())
-    ))
+    let messages = &user_survey.get_gpt_messages();
+    let params = &user_survey.survey_config.params;
+
+    let gpt_answer = get_openai_question(messages, params).await?;
+
+    match gpt_answer {
+        GptAnswer::Question(question) => Ok(Some(question)),
+        GptAnswer::FunctionCallArgs(call_args) => {
+            for arg in &call_args {
+                user_survey.set_param(&arg)?;
+                user_survey.add_assistant_question(&format!("Param {} saved!", arg.index));
+                user_survey.add_user_answer("What now?");
+            }
+
+            Box::pin(get_question(user_survey, counter + 1)).await
+        }
+    }
 }
 
 
@@ -409,16 +501,12 @@ async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -
 
     let mut tools = Vec::new();
     if !params.is_empty() {
-        let params_description = params.iter().enumerate()
-            .map(|(index, param)| format!("[{}] {}", index, param))
-            .collect::<Vec<String>>()
-            .join("\n");
-
         tools.push(json!({
             "type": "function",
             "function": {
                 "name": "set_params",
-                "description": format!("Set or update parameter by index for:\n{}", params_description),
+                // "description": format!("Set or update parameter by index for:\n{}", params_description),
+                "description": "Set or update parameter by index",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -447,9 +535,8 @@ async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -
     }
 
     let data = json!({
-        "model": "gpt-4",
+        "model": "gpt-3.5-turbo",
         "messages": messages,
-        "temperature": 0.7,
         "tools": tools
     });
 
