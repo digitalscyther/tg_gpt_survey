@@ -1,6 +1,10 @@
 // $env:RUST_LOG="debug"; $env:TELOXIDE_TOKEN=""; cargo run
 use std::collections::HashMap;
-use std::env;
+use std::{env, fs};
+use std::fs::File;
+
+use chrono::{Datelike, Timelike, Utc};
+use csv::WriterBuilder;
 use dotenv::dotenv;
 use env_logger;
 use log::*;
@@ -10,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use teloxide::dispatching::dialogue::InMemStorage;
 use teloxide::prelude::*;
-use teloxide::types::ChatAction;
+use teloxide::types::{ChatAction, InputFile};
 
 
 const DB_NAME: &str = "db.sqlite";
@@ -419,14 +423,15 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
     }
 
     if text == "/export_csv" {
-        // TODO
-        bot.send_message(msg.chat.id, "TODO 1").await?;
+        let (file_path, document) = get_document(&user_survey, &conn).expect("foo");
+        bot.send_document(msg.chat.id, document).await?;
+        delete_document(&file_path);
         return Ok(());
     }
 
     if text == "/start" || text == "/help" {
-        // TODO
-        bot.send_message(msg.chat.id, "TODO 2").await?;
+        let help_text = &env::var("HELP_TEXT").unwrap_or("START".to_string());
+        bot.send_message(msg.chat.id, help_text).await?;
         return Ok(());
     }
 
@@ -450,7 +455,7 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
     user_survey.tokens -= spent_tokens;
     user_survey.add_assistant_question(question.as_str());
     user_survey.sync_data(&conn).ok();
-    info!("{:?}", user_survey);
+    // info!("{:?}", user_survey);
 
     Ok(())
 }
@@ -479,6 +484,35 @@ async fn get_question(user_survey: &mut UserSurvey, counter: u8, tokens: i64) ->
             Box::pin(get_question(user_survey, counter + 1, spent_tokens + tokens)).await
         }
     }
+}
+
+fn get_document(_user_survey: &UserSurvey, _conn: &Connection) -> Result<(String, InputFile)> {
+    let data = vec!["foo", "bar", "baz"];
+
+    let dt_now = Utc::now();
+    let formatted_date_time = format!(
+        "{:04}-{:02}-{:02}T{:02} {:02} {:.3}Z",
+        dt_now.year(),
+        dt_now.month(),
+        dt_now.day(),
+        dt_now.hour(),
+        dt_now.minute(),
+        dt_now.second() as f32 + dt_now.nanosecond() as f32 / 1_000_000_000.0
+    );
+    let file_path = &format!("export_{}.csv", formatted_date_time);
+
+    let file = File::create(file_path).expect("foo");
+    let mut csv_writer = WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(file);
+    csv_writer.write_record(data).expect("foo");
+    csv_writer.flush().expect("foo");
+
+    Ok((file_path.to_string(), InputFile::file(file_path)))
+}
+
+fn delete_document(file_path: &str) {
+    fs::remove_file(file_path).expect("foo")
 }
 
 
