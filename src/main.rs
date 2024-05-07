@@ -19,20 +19,21 @@ use teloxide::types::{ChatAction, InputFile};
 
 const DB_NAME: &str = "db.sqlite";
 const USER_TABLE_NAME: &str = "user";
+const SURVEY_TABLE_NAME: &str = "survey";
 const DEFAULT_PARAMS: [&str; 2] = ["Name", "Phone"];
-const DEFAULT_PROMPT: &str = "# Character\nYou are an HR specialist at Google Meta. Your task is to interview candidates for the position of Marketing Manager.\n\n## Skills\n\n### Skill 1: Gathering Candidate Information\n- Inquire about the following:\n{}\n\n## Constraints:\n- Ensure the conversation continues until all information is gathered. Once complete, bid farewell and inform the candidate that they will receive a response regarding their candidacy via the provided email address or phone number. Provide these contact details in your closing statement. No need to ask more if there is nothing in \"Inquire about the following\". If person ask to change data, do it.";
-
+const DEFAULT_PROMPT: &str = "# Character\nYou are an HR specialist at Google Meta. Your task is to interview candidates for the position of Marketing Manager.\n\n## Skills\n\n### Skill 1: Gathering Candidate Information\n- Inquire about the following:\n{params}\n\n## Constraints:\n- Ensure the conversation continues until all information is gathered. Once complete, bid farewell and inform the candidate that they will receive a response regarding their candidacy via the provided email address or phone number. Provide these contact details in your closing statement. No need to ask more if there is nothing in \"Inquire about the following\". If person ask to change data, do it.";
+const PROMPT_PARAMS_TEMPLATE: &str = "{params}";
 const HISTORY_LIMIT: usize = 10000;
 const MAX_USER_TOKENS: i64 = 5000;
 
-async fn create_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
+fn create_tables(conn: &Connection) {
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS survey (
+        &format!("CREATE TABLE IF NOT EXISTS {} (
             id INTEGER PRIMARY KEY,
             data TEXT NOT NULL
-        )",
+        )", SURVEY_TABLE_NAME),
         [],
-    )?;
+    ).expect("foo");
 
     conn.execute(
         &format!("CREATE TABLE IF NOT EXISTS {} (
@@ -42,15 +43,19 @@ async fn create_tables(conn: &Connection) -> Result<(), rusqlite::Error> {
             data TEXT NOT NULL
         )", USER_TABLE_NAME),
         [],
-    )?;
-
-    Ok(())
+    ).expect("foo");
 }
 
-async fn change_or_create_survey(conn: &Connection, survey_data: &str) -> Result<(), rusqlite::Error> {
-    // Check if a survey already exists
+fn change_or_create_survey(survey_config: &SurveyConfig, conn: &Connection) {
+    let survey_config_json = serde_json::to_string(&survey_config);
+
+    let survey_config_str = match survey_config_json {
+        Ok(value) => value,
+        Err(_) => { panic!("Invalid survey_config_data") }
+    };
+
     let existing_survey: Option<i64> = match conn.query_row(
-        "SELECT id FROM survey ORDER BY id LIMIT 1",
+        &format!("SELECT id FROM {} ORDER BY id LIMIT 1", SURVEY_TABLE_NAME),
         [],
         |row| row.get(0),
     ) {
@@ -59,27 +64,23 @@ async fn change_or_create_survey(conn: &Connection, survey_data: &str) -> Result
     };
 
     if let Some(survey_id) = existing_survey {
-        // Update existing survey
         conn.execute(
-            "UPDATE survey SET data = ? WHERE id = ?",
-            params![survey_data, survey_id],
-        )?;
+            &format!("UPDATE {} SET data = ? WHERE id = ?", SURVEY_TABLE_NAME),
+            params![survey_config_str, survey_id],
+        ).expect("foo");
         info!("Survey updated successfully");
     } else {
-        // Create new survey
         conn.execute(
-            "INSERT INTO survey (data) VALUES (?)",
-            params![survey_data],
-        )?;
+            &format!("INSERT INTO {} (data) VALUES (?)", SURVEY_TABLE_NAME),
+            params![survey_config_str],
+        ).expect("foo");
         info!("New survey created successfully");
     }
-
-    Ok(())
 }
 
 fn get_survey_data(conn: &Connection) -> Result<String, rusqlite::Error> {
     let data: String = conn.query_row(
-        "SELECT data FROM survey ORDER BY id LIMIT 1",
+        &format!("SELECT data FROM {} ORDER BY id LIMIT 1", SURVEY_TABLE_NAME),
         [],
         |row| row.get(0),
     )?;
@@ -95,12 +96,11 @@ fn get_user_data_json(chat_id: i64, conn: &Connection) -> Result<(i64, String), 
     Ok(row)
 }
 
-fn clear_user_table(conn: &Connection) -> Result<(), rusqlite::Error> {
+fn clear_user_table(conn: &Connection) {
     conn.execute(
         &format!("DELETE FROM {}", USER_TABLE_NAME),
         [],
-    )?;
-    Ok(())
+    ).expect("foo");
 }
 
 fn extract_survey_config(json_string: &str) -> Option<SurveyConfig> {
@@ -128,9 +128,11 @@ impl SurveyConfig {
 
     fn format_prompt(&self, unknown_str: &str) -> String {
         let mut prompt = self.prompt.clone();
-        if let Some(index) = prompt.find("{}") {
-            prompt.replace_range(index..(index + 2), unknown_str);
+
+        if let Some(index) = prompt.find(PROMPT_PARAMS_TEMPLATE) {
+            prompt.replace_range(index..(index + PROMPT_PARAMS_TEMPLATE.len()), unknown_str);
         }
+
         prompt
     }
 }
@@ -166,25 +168,10 @@ fn get_user_data(
     }
 }
 
-async fn create_default_survey(conn: &Connection) -> Result<(), rusqlite::Error> {
-    let survey_config_data = get_default_survey_config();
+fn create_default_survey(conn: &Connection) {
+    let survey_config = get_default_survey_config();
 
-    let survey_config_json = serde_json::to_string(&survey_config_data);
-
-    let survey_config_str = match survey_config_json {
-        Ok(value) => value,
-        Err(_) => { panic!("Invalid survey_config_data") }
-    };
-
-    match change_or_create_survey(&conn, &survey_config_str).await {
-        Ok(_) => {}
-        Err(err) => {
-            eprintln!("Failed to create survey: {}", err);
-            return Err(err);
-        }
-    }
-
-    Ok(())
+    change_or_create_survey(&survey_config, &conn);
 }
 
 fn get_default_survey_config() -> SurveyConfig {
@@ -194,23 +181,18 @@ fn get_default_survey_config() -> SurveyConfig {
     );
 }
 
-async fn prepare_db(conn: &Connection) -> Result<(), rusqlite::Error> {
-    create_tables(&conn).await?;
+fn prepare_db(conn: &Connection) {
+    create_tables(&conn);
 
     match get_survey_config(&conn) {
         Some(survey_config) => {
             info!("Existing survey config - {:?}", survey_config);
         }
         _ => {
-            if let Err(err) = create_default_survey(&conn).await {
-                eprintln!("Failed to create default survey config: {}", err);
-                return Err(err);
-            }
+            create_default_survey(&conn);
             info!("Default survey config created successfully");
         }
     }
-
-    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -288,7 +270,6 @@ impl UserSurvey {
             }
         }
 
-        // Generate the result string
         let mut know_unknown = String::new();
         for (index, name) in self.survey_config.params.iter().enumerate() {
             if let Some(value) = known.get(&index) {
@@ -417,7 +398,7 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
     let mut user_survey = UserSurvey::new(msg.chat.id.0, survey_config, &conn);
 
     if text == "/clear_user_table" {
-        clear_user_table(&conn).unwrap();
+        clear_user_table(&conn);
         bot.send_message(msg.chat.id, "User table cleared").await?;
         return Ok(());
     }
@@ -435,15 +416,42 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
         return Ok(());
     }
 
-    if text.starts_with("/prompt") {
-        // TODO
-        bot.send_message(msg.chat.id, "TODO 3").await?;
+    let prompt_command = "/prompt";
+    if text.starts_with(prompt_command) {
+        let new_prompt = get_command_body(prompt_command, text);
+        let answer;
+        if new_prompt.contains(PROMPT_PARAMS_TEMPLATE) {
+            user_survey.survey_config.prompt = new_prompt.clone();
+            change_or_create_survey(&user_survey.survey_config, &conn);
+            clear_user_table(&conn);
+            answer = format!("New prompt:\n{}", new_prompt);
+        } else {
+            answer = format!("Invalid prompt. Prompt must contain \"{}\"", PROMPT_PARAMS_TEMPLATE);
+        }
+        bot.send_message(msg.chat.id, answer).await?;
         return Ok(());
     }
 
-    if text.starts_with("/params") {
-        // TODO
-        bot.send_message(msg.chat.id, "TODO 4").await?;
+    let params_command = "/params";
+    if text.starts_with(params_command) {
+        let new_params_text = get_command_body(params_command, text);
+        let new_params: Vec<String> = new_params_text
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect();
+
+        let answer;
+        if new_params.is_empty() {
+            answer = "No valid parameters provided. Please provide valid parameters.".to_string();
+        } else {
+            user_survey.survey_config.params = new_params.clone();
+            change_or_create_survey(&user_survey.survey_config, &conn);
+            clear_user_table(&conn);
+            answer = format!("Parameters updated:\n{}", new_params.join("\n"));
+        }
+
+        bot.send_message(msg.chat.id, answer).await?;
         return Ok(());
     }
 
@@ -460,12 +468,17 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
     Ok(())
 }
 
+fn get_command_body(prefix: &str, text: &str) -> String {
+    text.trim_start_matches(prefix).trim().to_string()
+}
+
+
 async fn get_question(user_survey: &mut UserSurvey, counter: u8, tokens: i64) -> Result<Option<(i64, String)>, Box<dyn std::error::Error>> {
     if counter > 3 {
-        return Ok(Some((tokens, "Error get question".to_string())));
+        return Ok(Some((tokens, "Error get question".to_string())));    // TODO - don't save
     }
     if user_survey.tokens < 0 {
-        return Ok(Some((tokens, "Have a great day!".to_string())));
+        return Ok(Some((tokens, "Have a great day!".to_string())));     // TODO - don't save
     }
 
     let messages = &user_survey.get_gpt_messages();
@@ -486,12 +499,41 @@ async fn get_question(user_survey: &mut UserSurvey, counter: u8, tokens: i64) ->
     }
 }
 
-fn get_document(_user_survey: &UserSurvey, _conn: &Connection) -> Result<(String, InputFile)> {
-    let data = vec!["foo", "bar", "baz"];
+fn get_document(user_survey: &UserSurvey, conn: &Connection) -> Result<(String, InputFile)> {
+    let rows: Result<Vec<String>, rusqlite::Error> = conn
+        .prepare(&format!("SELECT data FROM {}", USER_TABLE_NAME))?
+        .query_map([], |row| row.get(0))?
+        .collect();
+
+    let rows: Vec<String> = rows?;
+    let mut user_data_array: Vec<UserData> = vec![];
+    for json_string in rows.iter() {
+        if let Some(user_data) = extract_user_data(&json_string) {
+            user_data_array.push(user_data)
+        }
+    }
+
+    let mut csv_data: Vec<Vec<&str>> = Vec::new();
+
+    for user_data in user_data_array.iter() {
+        let mut row: Vec<&str> = Vec::new();
+        for header in &user_survey.survey_config.params {
+            if let Some(param) = user_data.params.iter().find(|param| param.name == *header) {
+                if let Some(value) = &param.value {
+                    row.push(value);
+                } else {
+                    row.push("");
+                }
+            } else {
+                row.push("");
+            }
+        }
+        csv_data.push(row);
+    }
 
     let dt_now = Utc::now();
     let formatted_date_time = format!(
-        "{:04}-{:02}-{:02}T{:02} {:02} {:.3}Z",
+        "{:04}-{:02}-{:02}T{:02}_{:02}_{:.3}Z",
         dt_now.year(),
         dt_now.month(),
         dt_now.day(),
@@ -505,7 +547,11 @@ fn get_document(_user_survey: &UserSurvey, _conn: &Connection) -> Result<(String
     let mut csv_writer = WriterBuilder::new()
         .has_headers(false)
         .from_writer(file);
-    csv_writer.write_record(data).expect("foo");
+
+    csv_writer.write_record(&user_survey.survey_config.params).expect("foo");
+    for row in csv_data.iter() {
+        csv_writer.write_record(row).expect("foo");
+    }
     csv_writer.flush().expect("foo");
 
     Ok((file_path.to_string(), InputFile::file(file_path)))
@@ -637,10 +683,7 @@ async fn main() -> Result<()> {
 
     let conn = establish_connection()?;
 
-    if let Err(err) = prepare_db(&conn).await {
-        eprintln!("Failed to prepare_db: {}", err);
-        return Err(err);
-    }
+    prepare_db(&conn);
 
     if let Err(err) = run_bot().await {
         eprintln!("Failed bot running: {}", err);
