@@ -24,7 +24,7 @@ const DEFAULT_PARAMS: [&str; 2] = ["Name", "Phone"];
 const DEFAULT_PROMPT: &str = "# Character\nYou are an HR specialist at Google Meta. Your task is to interview candidates for the position of Marketing Manager.\n\n## Skills\n\n### Skill 1: Gathering Candidate Information\n- Inquire about the following:\n{params}\n\n## Constraints:\n- Ensure the conversation continues until all information is gathered. Once complete, bid farewell and inform the candidate that they will receive a response regarding their candidacy via the provided email address or phone number. Provide these contact details in your closing statement. No need to ask more if there is nothing in \"Inquire about the following\". If person ask to change data, do it.";
 const PROMPT_PARAMS_TEMPLATE: &str = "{params}";
 const HISTORY_LIMIT: usize = 10000;
-const MAX_USER_TOKENS: i64 = 10000;
+const MAX_USER_TOKENS: i64 = 20000;
 
 fn create_tables(conn: &Connection) {
     conn.execute(
