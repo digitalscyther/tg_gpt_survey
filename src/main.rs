@@ -202,11 +202,49 @@ struct Param {
     value: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Function {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ToolCall {
+    id: String,
+    r#type: String,
+    function: Function,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct GptMessage {
     role: String,
-    content: String,
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+impl GptMessage {
+    fn new(role: String, content: String) -> Self {
+        GptMessage::new_full(role, content, None, None, None)
+    }
+
+    fn new_tool_answer(tool_call_id: String, func_name: String, func_response: String) -> Self {
+        GptMessage::new_full(
+            "tool".to_string(),
+            func_response,
+            Some(tool_call_id),
+            Some(func_name),
+            None,
+        )
+    }
+
+    fn new_full(role: String, content: String, tool_call_id: Option<String>, name: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> Self {
+        Self { role, content: Some(content), tool_call_id, name, tool_calls }
+    }
 }
 
 
@@ -280,15 +318,21 @@ impl UserSurvey {
         }
 
         let mut result = vec![
-            GptMessage {
-                role: "system".to_string(),
-                content: self.survey_config.format_prompt(&know_unknown),
-            }
+            GptMessage::new(
+                "system".to_string(),
+                self.survey_config.format_prompt(&know_unknown),
+            )
         ];
-        let mut chars_count = result[0].content.len();
+        let mut chars_count = match &result[0].content {
+            Some(content) => content.len(),
+            None => 0
+        };
 
         for msg in self._data.messages.iter().rev() {
-            chars_count += msg.content.len();
+            chars_count += match &msg.content {
+                Some(content) => content.len(),
+                None => 0
+            };
             if chars_count > HISTORY_LIMIT {
                 break;
             }
@@ -302,8 +346,18 @@ impl UserSurvey {
         self.add_message("user", text);
     }
 
-    fn add_system_text(&mut self, text: &str) {
-        self.add_message("system", text);
+    fn add_tool_call(&mut self, func_arg: FunctionArg, result: &str) {
+        self._data.messages.push(
+            GptMessage::new_tool_answer(
+                func_arg.tool_call_id,
+                result.to_string(),
+                func_arg.func_name,
+            )
+        )
+    }
+
+    fn add_gpt_message(&mut self, gpt_answer: GptMessage) {
+        self._data.messages.push(gpt_answer)
     }
 
     fn add_assistant_question(&mut self, text: &str) {
@@ -311,10 +365,7 @@ impl UserSurvey {
     }
 
     fn add_message(&mut self, role: &str, content: &str) {
-        self._data.messages.push(GptMessage {
-            role: role.to_string(),
-            content: content.to_string(),
-        });
+        self._data.messages.push(GptMessage::new(role.to_string(), content.to_string()));
     }
 
     fn sync_data(&mut self, conn: &Connection) -> Result<()> {
@@ -484,14 +535,15 @@ async fn get_question(user_survey: &mut UserSurvey, counter: u8, tokens: i64) ->
     let messages = &user_survey.get_gpt_messages();
     let params = &user_survey.survey_config.params;
 
-    let (gpt_answer, spent_tokens) = get_openai_question(messages, params).await?;
+    let (gpt_answer, spent_tokens, gpt_message) = get_openai_question(messages, params).await?;
 
     match gpt_answer {
         GptAnswer::Question(question) => Ok(Some((spent_tokens + tokens, question))),
         GptAnswer::FunctionCallArgs(call_args) => {
-            for arg in &call_args {
-                let param_name = user_survey.set_param(&arg)?;
-                user_survey.add_system_text(&format!("Param [{}] {} set to {}!", arg.index, param_name, arg.value));
+            user_survey.add_gpt_message(gpt_message.unwrap());
+            for arg in call_args {
+                user_survey.set_param(&arg)?;
+                user_survey.add_tool_call(arg, "success");
             }
 
             Box::pin(get_question(user_survey, counter + 1, spent_tokens + tokens)).await
@@ -572,9 +624,11 @@ enum GptAnswer {
 struct FunctionArg {
     index: i32,
     value: String,
+    tool_call_id: String,
+    func_name: String,
 }
 
-async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -> Result<(GptAnswer, i64)> {
+async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -> Result<(GptAnswer, i64, Option<GptMessage>)> {
     let openai_api_key = &env::var("OPENAI_API_KEY").expect("foo");
 
     let client = reqwest::Client::builder()
@@ -586,33 +640,26 @@ async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -
 
     let mut tools = Vec::new();
     if !params.is_empty() {
+        let indexes = generate_index_array(params.len());
         tools.push(json!({
             "type": "function",
             "function": {
-                "name": "set_params",
-                "description": "Set parameter values by index",
+                "name": "set_param",
+                "description": "Set parameter value by index",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "to_set": {
-                            "type": "array",
-                            "description": "Array of parameters to set",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "index": {
-                                        "type": "integer",
-                                        "description": "Index of the parameter"
-                                    },
-                                    "value": {
-                                        "description": "Value to set at the index"
-                                    }
-                                },
-                                "required": ["index", "value"]
-                            }
+                        "index": {
+                            "type": "integer",
+                            "enum": indexes,
+                            "description": "Index of the parameter",
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "Parameter value"
                         }
                     },
-                    "required": ["to_set"]
+                    "required": ["index", "value"]
                 }
             }
         }));
@@ -637,7 +684,15 @@ async fn get_openai_question(messages: &Vec<GptMessage>, params: &Vec<String>) -
     Ok(gpt_answer)
 }
 
-fn json_to_gpt_answer(json_str: &String) -> (GptAnswer, i64) {
+fn generate_index_array(n: usize) -> Value {
+    let mut array = Vec::new();
+    for i in 0..n {
+        array.push(i);
+    }
+    json!(array)
+}
+
+fn json_to_gpt_answer(json_str: &String) -> (GptAnswer, i64, Option<GptMessage>) {
     let v: Value = serde_json::from_str(json_str).unwrap();
 
     let finish_reason = v["choices"][0]["finish_reason"].as_str().unwrap_or("");
@@ -645,29 +700,51 @@ fn json_to_gpt_answer(json_str: &String) -> (GptAnswer, i64) {
 
     match finish_reason {
         "tool_calls" => {
-            let args = v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
-                .as_str()
-                .unwrap_or("");
-            let args = args.replace("\\", "");
-            let args = args.trim_matches('"');
-
             let mut function_args = Vec::new();
-            let args_json: Value = serde_json::from_str(args).unwrap();
-            for arg in args_json["to_set"].as_array().unwrap() {
-                let index = arg["index"].as_i64().unwrap() as i32;
-                let value = arg["value"].as_str().unwrap().to_string();
-                function_args.push(FunctionArg { index, value });
+
+            let gpt_message_value = match v["choices"][0]["message"].as_object() {
+                Some(value) => value,
+                None => {
+                    panic!("Error: 'message' field is not an object or does not exist");
+                }
+            };
+
+            let gpt_message: GptMessage = match serde_json::from_value(Value::Object(gpt_message_value.clone())) {
+                Ok(message) => message,
+                Err(err) => {
+                    panic!("Error deserializing JSON: {:?}", err);
+                }
+            };
+
+            for tool_call in gpt_message.clone().tool_calls.unwrap() {
+                let mut args_str_cleaned: &str = &tool_call.function.arguments.replace("\\", "");
+                args_str_cleaned = args_str_cleaned.trim_matches('"');
+
+                let args_json: Value = serde_json::from_str(args_str_cleaned).unwrap();
+
+                let index = args_json["index"].as_i64().unwrap() as i32;
+                let value = args_json["value"].as_str().unwrap().to_string();
+
+                function_args.push(FunctionArg {
+                    index,
+                    value,
+                    tool_call_id: tool_call.id,
+                    func_name: tool_call.function.name,
+                });
             }
-            (GptAnswer::FunctionCallArgs(function_args), spent_tokens)
+            (GptAnswer::FunctionCallArgs(function_args), spent_tokens, Some(gpt_message))
         }
         "stop" => {
             let content = v["choices"][0]["message"]["content"]
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            (GptAnswer::Question(content), spent_tokens)
+            (GptAnswer::Question(content), spent_tokens, None)
         }
-        _ => panic!("Unknown finish_reason"),
+        _ => {
+            error!("unknown openai response: {:?}", v);
+            panic!("Unknown finish_reason")
+        }
     }
 }
 
