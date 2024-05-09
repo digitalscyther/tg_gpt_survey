@@ -17,7 +17,8 @@ use teloxide::RequestError;
 use teloxide::update_listeners::webhooks;
 use teloxide::types::{ChatAction, InputFile};
 
-
+const WEBHOOK_FEATURE: &str = "WEBHOOK";
+const TRUE_VALUES: [&str; 4] = ["yes", "y", "1", "true"];
 const DB_NAME: &str = "db.sqlite";
 const USER_TABLE_NAME: &str = "user";
 const SURVEY_TABLE_NAME: &str = "survey";
@@ -417,18 +418,30 @@ enum State {
 async fn run_bot() -> Result<()> {
     let bot = Bot::from_env();
 
-    let localhost_port: u16 = env::var("LOCALHOST_PORT").unwrap_or("4444".to_string()).parse::<u16>().unwrap();
-    let host = env::var("HOST").expect("HOST env variable is not set");
-    let addr = ([127, 0, 0, 1], localhost_port).into();
-    let url = format!("https://{host}/tg_webhook").parse().unwrap();
-    let listener = webhooks::axum(bot.clone(), webhooks::Options::new(addr, url))
-        .await
-        .expect("Couldn't setup webhook");
+    if is_feature_turned_on(WEBHOOK_FEATURE) {
+        info!("1");
+        let localhost_port: u16 = env::var("LOCALHOST_PORT").unwrap_or("4444".to_string()).parse::<u16>().unwrap();
+        let host = env::var("HOST").expect("HOST env variable is not set");
+        let addr = ([127, 0, 0, 1], localhost_port).into();
+        let url = format!("https://{host}/tg_webhook").parse().unwrap();
+        let listener = webhooks::axum(bot.clone(), webhooks::Options::new(addr, url))
+            .await
+            .expect("Couldn't setup webhook");
 
-    let bot_runner = teloxide::repl_with_listener(bot, answer, listener);
-    bot_runner.await;
+        teloxide::repl_with_listener(bot, answer, listener).await;
+    } else {
+        info!("2");
+        teloxide::repl(bot, answer).await;
+    }
 
     Ok(())
+}
+
+fn is_feature_turned_on(name: &str) -> bool {
+    match env::var(name) {
+        Ok(val) => TRUE_VALUES.contains(&val.as_str()),
+        _ => false
+    }
 }
 
 async fn answer(bot: Bot, msg: Message) -> Result<(), RequestError> {
