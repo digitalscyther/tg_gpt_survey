@@ -12,8 +12,9 @@ use reqwest::header::HeaderMap;
 use rusqlite::{params, Connection, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use teloxide::dispatching::dialogue::InMemStorage;
 use teloxide::prelude::*;
+use teloxide::RequestError;
+use teloxide::update_listeners::webhooks;
 use teloxide::types::{ChatAction, InputFile};
 
 
@@ -405,8 +406,6 @@ impl UserSurvey {
     }
 }
 
-type MyDialogue = Dialogue<State, InMemStorage<State>>;
-type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Clone, Default)]
 enum State {
@@ -418,22 +417,21 @@ enum State {
 async fn run_bot() -> Result<()> {
     let bot = Bot::from_env();
 
-    Dispatcher::builder(
-        bot,
-        Update::filter_message()
-            .enter_dialogue::<Message, InMemStorage<State>, State>()
-            .branch(dptree::case![State::Answer].endpoint(answer)),
-    )
-        .dependencies(dptree::deps![InMemStorage::<State>::new()])
-        .enable_ctrlc_handler()
-        .build()
-        .dispatch()
-        .await;
+    let localhost_port: u16 = env::var("LOCALHOST_PORT").unwrap_or("4444".to_string()).parse::<u16>().unwrap();
+    let host = env::var("HOST").expect("HOST env variable is not set");
+    let addr = ([127, 0, 0, 1], localhost_port).into();
+    let url = format!("https://{host}/tg_webhook").parse().unwrap();
+    let listener = webhooks::axum(bot.clone(), webhooks::Options::new(addr, url))
+        .await
+        .expect("Couldn't setup webhook");
+
+    let bot_runner = teloxide::repl_with_listener(bot, answer, listener);
+    bot_runner.await;
 
     Ok(())
 }
 
-async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult {
+async fn answer(bot: Bot, msg: Message) -> Result<(), RequestError> {
     bot.send_chat_action(msg.chat.id, ChatAction::Typing).await?;
 
     let text = match msg.text() {
@@ -444,7 +442,7 @@ async fn answer(bot: Bot, _dialogue: MyDialogue, msg: Message) -> HandlerResult 
         }
     };
 
-    let conn = establish_connection()?;
+    let conn = establish_connection().expect("foo");
     let survey_config: SurveyConfig = get_survey_config(&conn).unwrap();
     let mut user_survey = UserSurvey::new(msg.chat.id.0, survey_config, &conn);
 
